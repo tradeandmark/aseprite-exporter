@@ -15,6 +15,7 @@ argparser.add_argument("--path", help="base path of directories that contain ass
 argparser.add_argument("--ase-dir", help="directory containing .ase source files, relative to --path")
 argparser.add_argument("--png-dir", help="directory containing .png export files, relative to --path")
 argparser.add_argument("--hashfile", help="path to the file dedicated to storing the file hashes")
+argparser.add_argument("--live-update", help="enable a mode where the script will continuously wait for file changes", action="store_true")
 argparser.add_argument("--preview", help="preview changes without writing to any files", action="store_true")
 argparser.add_argument("--nopretty", help="don't use fancy formatting", action="store_true")
 
@@ -26,6 +27,7 @@ class params:
     ase_dir = args.ase_dir or "ase"
     png_dir = args.png_dir or "png"
     hashfile = args.hashfile or os.path.join(path, ".hashes")
+    live_update = args.live_update or False
     nopretty = args.nopretty or False
     preview = args.preview or False
 
@@ -65,140 +67,168 @@ if os.name == "nt":
     if err == 0: # 0 indicates an error
         params.nopretty = True
 
+def run_exporter():
+    ## Stage 1: Find existing .ase and .ase.png files, and read hash file
 
-## Stage 1: Find existing .ase and .ase.png files, and read hash file
+    print(c("Reading files... ", "bold"), end="")
 
-print(c("Reading files... ", "bold"), end="")
+    ase_files, png_files = [], []
 
-ase_files, png_files = [], []
+    # Hashes of each file on disk, for comparison with last exported hashes
+    newhashes = {}
+    # Find .ase files in ase_path
+    for (dirname, _, filenames) in os.walk(ase_path):
+        for name in sorted(filenames):
+            if name.endswith(".ase"):
+                ase = os.path.relpath(os.path.join(dirname, name), ase_path)
+                ase_files.append(ase)
+    
+                # Hash each file
+                with open(os.path.join(dirname, name), "rb") as f:
+                        newhashes[ase] = hashlib.sha256(f.read()).hexdigest()
+    # Find .ase.png files in png_path
 
-# Hashes of each file on disk, for comparison with last exported hashes
-newhashes = {}
-# Find .ase files in ase_path
-for (dirname, _, filenames) in os.walk(ase_path):
-    for name in sorted(filenames):
-        if name.endswith(".ase"):
-            ase = os.path.relpath(os.path.join(dirname, name), ase_path)
-            ase_files.append(ase)
- 
-            # Hash each file
-            with open(os.path.join(dirname, name), "rb") as f:
-                    newhashes[ase] = hashlib.sha256(f.read()).hexdigest()
-# Find .ase.png files in png_path
+    for (dirname, _, filenames) in os.walk(png_path):
+        for name in filenames:
+            if name.endswith(".ase.png"):
+                png = os.path.relpath(os.path.join(dirname, name[:-4]), png_path)
+                png_files.append(png)
 
-for (dirname, _, filenames) in os.walk(png_path):
-    for name in filenames:
-        if name.endswith(".ase.png"):
-            png = os.path.relpath(os.path.join(dirname, name[:-4]), png_path)
-            png_files.append(png)
+    # Hashes from hash file, stored from the last time sprites were exported
+    oldhashes = {}
+    hashfile_found = False
+    try:
+        with open(hashfile_path, "r") as f:
+            hashfile_found = True
+            for line in f.read().split('\n'):
+                if not line.startswith("# ") and line.strip() != "":
+                    [name, hash] = line.rsplit(' ', 1)
+                    oldhashes[name] = hash
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        raise e
 
-# Hashes from hash file, stored from the last time sprites were exported
-oldhashes = {}
-hashfile_found = False
-try:
-    with open(hashfile_path, "r") as f:
-        hashfile_found = True
-        for line in f.read().split('\n'):
-            if not line.startswith("# ") and line.strip() != "":
-                [name, hash] = line.rsplit(' ', 1)
-                oldhashes[name] = hash
-except FileNotFoundError:
-    pass
-except Exception as e:
-    raise e
-
-if hashfile_found:
-    print(f"found {len(ase_files)} .ase files, {len(png_files)} .png files and a hash file with {len(oldhashes.keys())} hashes")
-else:
-    print(f"found {len(ase_files)} .ase files, {len(png_files)} .png files and no hash file")
-# print(oldhashes, newhashes) # YAYAYAYA
-
-
-## Stage 2: Work out which things need to be exported, (re)exported or deleted
-
-print(c("Identifying changes... ", "bold"), end="")
-
-to_export_added, to_export_updated, to_delete = [], [], []
-added_count, updated_count, deleted_count, unchanged_count = 0, 0, 0, 0
-
-# Iterate through files, check for changes
-for ase in ase_files:
-    if ase not in png_files:
-        # New .ase file (ase exists but no png):
-        # - Add ase to export list, regardless of current hash
-        added_count += 1
-        to_export_added.append(ase)
-
+    if hashfile_found:
+        print(f"Found {len(ase_files)} .ase files, {len(png_files)} .png files and a hash file with {len(oldhashes.keys())} hashes")
     else:
-        # .ase file is not new
-        # - Compare hashes
-        if ase not in oldhashes or newhashes[ase] != oldhashes[ase]:
-            # Hash is different
-            # - Add ase to export
-            updated_count += 1
-            to_export_updated.append(ase)
+        print(f"Found {len(ase_files)} .ase files, {len(png_files)} .png files and no hash file")
+    # print(oldhashes, newhashes) # YAYAYAYA
+
+
+    ## Stage 2: Work out which things need to be exported, (re)exported or deleted
+
+    print(c("Identifying changes... ", "bold"), end="")
+
+    to_export_added, to_export_updated, to_delete = [], [], []
+    added_count, updated_count, deleted_count, unchanged_count = 0, 0, 0, 0
+
+    # Iterate through files, check for changes
+    for ase in ase_files:
+        if ase not in png_files:
+            # New .ase file (ase exists but no png):
+            # - Add ase to export list, regardless of current hash
+            added_count += 1
+            to_export_added.append(ase)
 
         else:
-            # Hash is same
-            # - Do nothing
-            unchanged_count += 1
+            # .ase file is not new
+            # - Compare hashes
+            if ase not in oldhashes or newhashes[ase] != oldhashes[ase]:
+                # Hash is different
+                # - Add ase to export
+                updated_count += 1
+                to_export_updated.append(ase)
 
-for png in png_files:
-    # Ase file deleted (png exists but no ase):
-    # - Add png to delete list
-    if png not in ase_files:
-        deleted_count += 1
-        to_delete.append(png + ".png")
+            else:
+                # Hash is same
+                # - Do nothing
+                unchanged_count += 1
 
-print(f"{added_count} added, {updated_count} updated, {deleted_count} deleted and {unchanged_count} unchanged")
+    for png in png_files:
+        # Ase file deleted (png exists but no ase):
+        # - Add png to delete list
+        if png not in ase_files:
+            deleted_count += 1
+            to_delete.append(png + ".png")
 
-if added_count == 0 and updated_count == 0 and deleted_count == 0:
-    print("Nothing to do!")
-    exit()
+    print(f"{added_count} added, {updated_count} updated, {deleted_count} deleted and {unchanged_count} unchanged")
 
-## Stage 3: Export and delete files, and update hash list
+    if added_count == 0 and updated_count == 0 and deleted_count == 0:
+        print("Nothing to do!")
+        return
 
-if params.preview:
-    print("Preview mode enabled, exiting before making changes")
-    exit()
+    ## Stage 3: Export and delete files, and update hash list
 
-print(c("Writing to all files and updating hash file:", "bold"))
+    if params.preview:
+        print("Preview mode enabled, exiting before making changes")
+        return
 
-def export_ase(file):
-    command = [aseprite_exe] + shlex.split(aseprite_args.format(
-        png_file=os.path.join(png_path, file),
-        ase_file=os.path.join(ase_path, file)))
-    pipes = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    std_out, std_err = pipes.communicate()
+    print(c("Writing to all files and updating hash file:", "bold"))
 
-    if len(std_err) or pipes.returncode != 0:
-        print(c(f"Error {pipes.returncode}!"))
-        print(c(std_err.decode(sys.getfilesystemencoding()).strip(), "red"))
-    else:
+    def export_ase(file):
+        command = [aseprite_exe] + shlex.split(aseprite_args.format(
+            png_file=os.path.join(png_path, file),
+            ase_file=os.path.join(ase_path, file)))
+        pipes = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        std_out, std_err = pipes.communicate()
+
+        if len(std_err) or pipes.returncode != 0:
+            print(c(f"Error {pipes.returncode}!"))
+            print(c(std_err.decode(sys.getfilesystemencoding()).strip(), "red"))
+        else:
+            print("Done")
+
+    for file in to_delete:
+        print(c(f"  - deleting {file}... ", "red"), end='')
+        os.remove(os.path.join(png_path, file))
+        try:
+            os.remove(os.path.join(png_path, f"{file}.import"))
+        except Exception:
+            pass
         print("Done")
 
-for file in to_delete:
-    print(c(f"  - deleting {file}... ", "red"), end='')
-    os.remove(os.path.join(png_path, file))
+    for file in to_export_updated:
+        print(c(f"  ~ {file} updated, exporting... ", "yellow"), end='')
+        export_ase(file)
+
+    for file in to_export_added:
+        print(c(f"  + {file} added, exporting... ", "green"), end='')
+        export_ase(file)
+
+    with open(hashfile_path, "w", encoding="utf-8", newline="\n") as f:
+        print("    Updating hash file... ", end='')
+        f.write("# Generated by spriteexporter.py\n")
+        for k in newhashes:
+            f.write(f"{k} {newhashes[k]}\n")
+        print("Done")
+
+if not params.live_update:
+    run_exporter()
+    print(c("All done, bye bye!", "bold"))
+else:
+    import time
+    import watchdog.events
+    import watchdog.observers
+
+    run_exporter()
+    print("Wating for file changes...")
+
+    def handle_update(event):
+        # print(f"\n{event.src_path} has been {event.event_type}")
+        print()
+        run_exporter()
+        print("Wating for file changes...")
+
+    event_handler = watchdog.events.FileSystemEventHandler()
+    event_handler.on_any_event = handle_update
+    observer = watchdog.observers.Observer()
+    observer.schedule(event_handler, ase_path, recursive=True)
+    observer.start()
+
     try:
-        os.remove(os.path.join(png_path, f"{file}.import"))
-    except Exception:
-        pass
-    print("Done")
-
-for file in to_export_updated:
-    print(c(f"  ~ {file} updated, exporting... ", "yellow"), end='')
-    export_ase(file)
-
-for file in to_export_added:
-    print(c(f"  + {file} added, exporting... ", "green"), end='')
-    export_ase(file)
-
-with open(hashfile_path, "w", encoding="utf-8", newline="\n") as f:
-    print("    Updating hash file... ", end='')
-    f.write("# Generated by spriteexporter.py\n")
-    for k in newhashes:
-        f.write(f"{k} {newhashes[k]}\n")
-    print("Done")
-
-print(c("All done, bye bye!", "bold"))
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
