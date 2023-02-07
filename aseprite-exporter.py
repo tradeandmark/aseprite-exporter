@@ -1,4 +1,6 @@
 #!/usr/bin/python3
+# aseprite-exporter
+# github.com/tradeandmark/aseprite-exporter
 
 import hashlib
 import os
